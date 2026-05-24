@@ -525,60 +525,261 @@ import os                        # ← NEW
 import datetime                  # ← NEW
 import pyModeS as pms
 from pyModeS.util import bin2hex,crc
+from aircraft_lookup import lookup, load_database
 
 # ── output folder (adsb_to_firebase.py watches this) ──────────────────────
 OUTPUT_DIR = "output"            # ← NEW
 os.makedirs(OUTPUT_DIR, exist_ok=True)  # ← NEW
+# Aircraft database path
+AIRCRAFT_DB_PATH = "aircraft-database.csv"
 
-# ── helper: write one JSON file per detected frame ─────────────────────────
-def export_message(shift_index, bin_str, magnitude,   # ← NEW FUNCTION
+# Load database once at startup
+load_database(AIRCRAFT_DB_PATH)
+
+# ================================================================
+#  PASTE THIS BLOCK AT THE TOP OF SignalVisualizer.py
+#  (replace the existing import block and export_message function)
+# ================================================================
+
+import math
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import time
+import threading
+import json
+import datetime
+import pyModeS as pms
+from pyModeS.util import bin2hex, crc
+
+# ── NEW imports ───────────────────────────────────────────────────────────
+from aircraft_lookup import lookup, load_database
+from cpr_position_buffer import attempt_position_decode, get_buffer_status
+
+# ── Output folder (adsb_to_firebase.py watches this) ─────────────────────
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ── Load aircraft database once at startup ────────────────────────────────
+AIRCRAFT_DB_PATH = "aircraft-database.csv"
+load_database(AIRCRAFT_DB_PATH)
+
+
+# ================================================================
+#  export_message()   ← FULL REPLACEMENT
+#
+#  WHAT CHANGED vs the old version:
+#  1. For AIRBORNE_POSITION (TC 9-18):
+#       - Does NOT write a JSON file immediately.
+#       - Passes the message to cpr_position_buffer.attempt_position_decode()
+#       - Only writes JSON when a valid EVEN+ODD pair is decoded.
+#  2. For all other message types:
+#       - Behaviour unchanged — JSON written immediately.
+#  3. Aircraft DB lookup now fills ALL 27 columns from the CSV.
+# ================================================================
+
+# ================================================================
+#  PASTE THIS BLOCK AT THE TOP OF SignalVisualizer.py
+#  (replace the existing import block and export_message function)
+# ================================================================
+
+import math
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import time
+import threading
+import json
+import datetime
+import pyModeS as pms
+from pyModeS.util import bin2hex, crc
+
+# ── NEW imports ───────────────────────────────────────────────────────────
+from aircraft_lookup import lookup, load_database
+from cpr_position_buffer import attempt_position_decode, get_buffer_status
+
+# ── Output folder (adsb_to_firebase.py watches this) ─────────────────────
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ── Load aircraft database once at startup ────────────────────────────────
+AIRCRAFT_DB_PATH = "aircraft-database.csv"
+load_database(AIRCRAFT_DB_PATH)
+
+
+# ================================================================
+#  export_message()   ← FULL REPLACEMENT
+#
+#  WHAT CHANGED vs the old version:
+#  1. For AIRBORNE_POSITION (TC 9-18):
+#       - Does NOT write a JSON file immediately.
+#       - Passes the message to cpr_position_buffer.attempt_position_decode()
+#       - Only writes JSON when a valid EVEN+ODD pair is decoded.
+#  2. For all other message types:
+#       - Behaviour unchanged — JSON written immediately.
+#  3. Aircraft DB lookup now fills ALL 27 columns from the CSV.
+# ================================================================
+
+def export_message(shift_index, bin_str, magnitude,
                    capture_file, start_byte,
                    c1_ratio=None, c3_power_ratio=None, c4_null_count=None):
     """
     Called once per detected frame immediately after bit-slicing.
-    Decodes the 112-bit binary string, builds a record, and writes it to
-    output/<shift_index>.json so that adsb_to_firebase.py picks it up
-    in real time via file-system watching.
-    """
-    record = {
-        "shift_index":    shift_index,
-        "captured_at":    datetime.datetime.utcnow().isoformat() + "Z",
-        "capture_file":   capture_file,
-        "slice_start_byte": start_byte,
-        "sample_rate_msps": 2,
-        "final_decision": True,
-        "c1_ratio":       round(c1_ratio, 3)       if c1_ratio       is not None else None,
-        "c2_match":       True,
-        "c3_power_ratio": round(c3_power_ratio, 4) if c3_power_ratio is not None else None,
-        "c4_null_count":  int(c4_null_count)        if c4_null_count  is not None else None,
-        "snr_db":         _snr(shift_index, magnitude),
 
-        # will be filled below
-        "hex_message":    None,
-        "crc_valid":      False,
-        "icao":           None,
-        "typecode":       None,
-        "df":             None,
-        "message_type":   "UNKNOWN",
-        "altitude_ft":    None,
-        "altitude_m":     None,
-        "latitude":       None,
-        "longitude":      None,
-        "raw_cpr_lat":    None,
-        "raw_cpr_lon":    None,
-        "cpr_format":     None,
-        "callsign":       None,
-        "groundspeed_kt":    None,
-        "groundspeed_kmh":   None,
-        "track_angle_deg":   None,
-        "airspeed_kt":       None,
-        "airspeed_kmh":      None,
-        "heading_deg":       None,
-        "vertical_rate_fpm": None,
-        "vertical_rate_ms":  None,
-        "vertical_status":   None,
+    For position messages (TC 9-18): stores the CPR frame and waits
+    for its pair (even↔odd). Only writes JSON when both are available
+    and the real lat/lon has been decoded.
+
+    For all other message types: decodes and writes JSON immediately.
+    """
+
+    # ── Step 1: Decode the binary string ─────────────────────────────────
+    record = _build_base_record(
+        shift_index, bin_str, magnitude,
+        capture_file, start_byte,
+        c1_ratio, c3_power_ratio, c4_null_count
+    )
+
+    # ── Step 2: Route based on message type ──────────────────────────────
+    msg_type = record.get("message_type", "UNKNOWN")
+    tc        = record.get("typecode")
+
+    is_position_msg = (
+        record.get("crc_valid") and
+        tc is not None and
+        (9 <= tc <= 18 or 5 <= tc <= 8)   # airborne OR surface position
+    )
+
+    if is_position_msg:
+        # ── POSITION: hand off to CPR buffer — DO NOT write JSON yet ─────
+        icao       = record.get("icao")
+        cpr_format = record.get("cpr_format")   # "Even" or "Odd"
+        hex_msg    = record.get("hex_message")
+
+        if icao and cpr_format and hex_msg:
+            print(f"[CPR] Position message received — ICAO:{icao.upper()}  "
+                  f"Format:{cpr_format}  TC:{tc}")
+            print(f"[CPR] Buffer status: {get_buffer_status()}")
+
+            # attempt_position_decode() returns:
+            #   None  → still waiting for the other CPR format
+            #   dict  → both formats received, real position decoded
+            completed = attempt_position_decode(
+                icao, cpr_format, hex_msg, record
+            )
+
+            if completed is None:
+                # Waiting for the pair — print status and return without writing
+                print(f"[CPR] ⏳ Waiting for "
+                      f"{'ODD' if cpr_format == 'Even' else 'EVEN'} "
+                      f"message from ICAO {icao.upper()}")
+                return   # ← JSON NOT written yet
+
+            # ── Pair complete — use the completed (position-filled) record
+            record = completed
+            print(f"[CPR] ✅ Writing position JSON for ICAO {icao.upper()}")
+        else:
+            print(f"[CPR] Missing ICAO/format/hex — skipping CPR buffer")
+            return
+
+    # ── Step 3: Write JSON (for non-position, or completed position pair) ─
+    _write_json(record)
+
+
+# ================================================================
+#  _build_base_record()
+#  Decodes the 112-bit binary string and builds the full record dict.
+#  Does everything the OLD export_message() did, minus the file write.
+# ================================================================
+
+def _build_base_record(shift_index, bin_str, magnitude,
+                       capture_file, start_byte,
+                       c1_ratio, c3_power_ratio, c4_null_count):
+    """
+    Decode one ADS-B frame and return a dict with all fields.
+    Does NOT write any file — that is _write_json()'s job.
+    """
+
+    record = {
+        # ── Signal / capture metadata ─────────────────────────────────────
+        "shift_index":        shift_index,
+        "captured_at":        datetime.datetime.utcnow().isoformat() + "Z",
+        "capture_file":       capture_file,
+        "slice_start_byte":   start_byte,
+        "sample_rate_msps":   2,
+        "final_decision":     True,
+        "c1_ratio":           round(c1_ratio, 3)       if c1_ratio       is not None else None,
+        "c2_match":           True,
+        "c3_power_ratio":     round(c3_power_ratio, 4) if c3_power_ratio is not None else None,
+        "c4_null_count":      int(c4_null_count)        if c4_null_count  is not None else None,
+        "snr_db":             _snr(shift_index, magnitude),
+
+        # ── Aircraft database fields (filled after DB lookup) ─────────────
+        "registration":       None,
+        "manufacturericao":   None,
+        "manufacturername":   None,
+        "model":              None,
+        "typecode_db":        None,
+        "serialnumber":       None,
+        "linenumber":         None,
+        "icaoaircrafttype":   None,
+        "operator":           None,
+        "operatorcallsign":   None,
+        "operatoricao":       None,
+        "operatoriata":       None,
+        "owner":              None,
+        "testreg":            None,
+        "registered":         None,
+        "reguntil":           None,
+        "status":             None,
+        "built":              None,
+        "firstflightdate":    None,
+        "seatconfiguration":  None,
+        "engines":            None,
+        "modes":              None,
+        "adsb_equipped":      None,
+        "acars":              None,
+        "notes":              None,
+        "categoryDescription": None,
+
+        # ── Decoded ADS-B fields ──────────────────────────────────────────
+        "hex_message":        None,
+        "crc_valid":          False,
+        "icao":               None,
+        "typecode":           None,
+        "df":                 None,
+        "message_type":       "UNKNOWN",
+
+        # ── Position fields ───────────────────────────────────────────────
+        "altitude_ft":        None,
+        "altitude_m":         None,
+        "latitude":           None,
+        "longitude":          None,
+        "raw_cpr_lat":        None,
+        "raw_cpr_lon":        None,
+        "cpr_format":         None,
+        "position_source":    None,
+        "cpr_even_hex":       None,
+        "cpr_odd_hex":        None,
+        "cpr_gap_samples":    None,   # gap in samples between even and odd
+        "cpr_gap_rf_s":       None,   # gap converted to RF seconds (gap/2MSPS)
+
+        # ── Identification ────────────────────────────────────────────────
+        "callsign":           None,
+
+        # ── Velocity ─────────────────────────────────────────────────────
+        "groundspeed_kt":     None,
+        "groundspeed_kmh":    None,
+        "track_angle_deg":    None,
+        "airspeed_kt":        None,
+        "airspeed_kmh":       None,
+        "heading_deg":        None,
+        "vertical_rate_fpm":  None,
+        "vertical_rate_ms":   None,
+        "vertical_status":    None,
     }
 
+    # ── Decode the message ────────────────────────────────────────────────
     try:
         hex_msg  = bin2hex(bin_str)
         decoded  = pms.decode(hex_msg)
@@ -593,50 +794,44 @@ def export_message(shift_index, bin_str, magnitude,   # ← NEW FUNCTION
 
         if is_valid and tc is not None:
 
+            # IDENTIFICATION (TC 1-4)
             if 1 <= tc <= 4:
                 record["message_type"] = "IDENTIFICATION"
                 record["callsign"]     = decoded.get("callsign")
 
+            # SURFACE POSITION (TC 5-8)
             elif 5 <= tc <= 8:
                 record["message_type"] = "SURFACE_POSITION"
                 gs = decoded.get("groundspeed")
                 if gs is not None:
                     record["groundspeed_kt"]  = round(gs, 2)
                     record["groundspeed_kmh"] = round(gs * 1.852, 2)
-                lat = decoded.get("latitude")
-                lon = decoded.get("longitude")
-                if lat is not None:
-                    record["latitude"]  = lat
-                    record["longitude"] = lon
-                else:
-                    if len(bin_str) >= 88:
-                        record["raw_cpr_lat"] = int(bin_str[54:71], 2)
-                        record["raw_cpr_lon"] = int(bin_str[71:88], 2)
+                # Raw CPR — real position decoded later via CPR buffer
+                if len(bin_str) >= 88:
+                    record["raw_cpr_lat"] = int(bin_str[54:71], 2)
+                    record["raw_cpr_lon"] = int(bin_str[71:88], 2)
                 cpr = decoded.get("cpr_format")
                 if cpr is None and len(bin_str) >= 54:
                     cpr = int(bin_str[53])
                 record["cpr_format"] = "Odd" if cpr == 1 else "Even"
 
+            # AIRBORNE POSITION (TC 9-18)
             elif 9 <= tc <= 18:
                 record["message_type"] = "AIRBORNE_POSITION"
                 alt_ft = decoded.get("altitude")
                 if alt_ft is not None:
                     record["altitude_ft"] = alt_ft
                     record["altitude_m"]  = round(alt_ft * 0.3048, 1)
-                lat = decoded.get("latitude")
-                lon = decoded.get("longitude")
-                if lat is not None:
-                    record["latitude"]  = lat
-                    record["longitude"] = lon
-                else:
-                    if len(bin_str) >= 88:
-                        record["raw_cpr_lat"] = int(bin_str[54:71], 2)
-                        record["raw_cpr_lon"] = int(bin_str[71:88], 2)
+                # Raw CPR — real position decoded later via CPR buffer
+                if len(bin_str) >= 88:
+                    record["raw_cpr_lat"] = int(bin_str[54:71], 2)
+                    record["raw_cpr_lon"] = int(bin_str[71:88], 2)
                 cpr = decoded.get("cpr_format")
                 if cpr is None and len(bin_str) >= 54:
                     cpr = int(bin_str[53])
                 record["cpr_format"] = "Odd" if cpr == 1 else "Even"
 
+            # AIRBORNE VELOCITY (TC 19)
             elif tc == 19:
                 record["message_type"] = "AIRBORNE_VELOCITY"
                 gs = decoded.get("groundspeed")
@@ -655,6 +850,7 @@ def export_message(shift_index, bin_str, magnitude,   # ← NEW FUNCTION
                     record["vertical_rate_ms"]  = round((vrate * 0.3048) / 60, 2)
                     record["vertical_status"]   = "Climbing" if vrate > 0 else "Descending"
 
+            # OPERATIONAL STATUS (TC 31)
             elif tc == 31:
                 record["message_type"] = "OPERATIONAL_STATUS"
                 record["callsign"]     = str(decoded.get("capability", "N/A"))
@@ -668,26 +864,294 @@ def export_message(shift_index, bin_str, magnitude,   # ← NEW FUNCTION
     except Exception as e:
         record["message_type"] = f"DECODE_ERROR: {e}"
 
-    # ── write atomically so the watcher never reads a half-written file ──
-    out_path = os.path.join(OUTPUT_DIR, f"{shift_index}.json")
-    tmp_path = out_path + ".tmp"
+    # ── Aircraft database lookup ──────────────────────────────────────────
+    _db_lookup(record)
+
+    return record
+
+
+def _db_lookup(record):
+    """
+    Fill all aircraft-database fields into record in-place.
+    Called for every message type — ICAO is always available.
+    """
+    icao_hex = record.get("icao")
+    if not icao_hex:
+        return
+
+    try:
+        label, info = lookup(icao_hex)
+        if info:
+            record["registration"]       = info.get("registration")
+            record["manufacturericao"]   = info.get("manufacturericao")
+            record["manufacturername"]   = info.get("manufacturername")
+            record["model"]              = info.get("model")
+            record["typecode_db"]        = info.get("typecode")
+            record["serialnumber"]       = info.get("serialnumber")
+            record["linenumber"]         = info.get("linenumber")
+            record["icaoaircrafttype"]   = info.get("icaoaircrafttype")
+            record["operator"]           = info.get("operator")
+            record["operatorcallsign"]   = info.get("operatorcallsign")
+            record["operatoricao"]       = info.get("operatoricao")
+            record["operatoriata"]       = info.get("operatoriata")
+            record["owner"]              = info.get("owner")
+            record["testreg"]            = info.get("testreg")
+            record["registered"]         = info.get("registered")
+            record["reguntil"]           = info.get("reguntil")
+            record["status"]             = info.get("status")
+            record["built"]              = info.get("built")
+            record["firstflightdate"]    = info.get("firstflightdate")
+            record["seatconfiguration"]  = info.get("seatconfiguration")
+            record["engines"]            = info.get("engines")
+            record["modes"]              = info.get("modes")
+            record["adsb_equipped"]      = info.get("adsb")
+            record["acars"]              = info.get("acars")
+            record["notes"]              = info.get("notes")
+            record["categoryDescription"]= info.get("categoryDescription")
+            print(f"  [DB] ✓ {icao_hex.upper()} → {label}")
+        else:
+            print(f"  [DB] ✗ {icao_hex.upper()} not in database")
+
+    except Exception as e:
+        print(f"  [DB] Lookup error for {icao_hex}: {e}")
+
+
+def _write_json(record):
+    """
+    Atomically write one JSON file to output/<shift_index>.json.
+    Using os.replace() ensures adsb_to_firebase.py never reads a
+    half-written file.
+    """
+    shift_index = record.get("shift_index", "unknown")
+    out_path    = os.path.join(OUTPUT_DIR, f"{shift_index}.json")
+    tmp_path    = out_path + ".tmp"
+
     with open(tmp_path, "w") as f:
         json.dump(record, f, indent=2)
-    os.replace(tmp_path, out_path)          # atomic on Linux & Windows
-    print(f"  [export] → {out_path}  ICAO:{record['icao']}  type:{record['message_type']}")
+    os.replace(tmp_path, out_path)
+
+    print(f"  [export] → {out_path}  "
+          f"ICAO:{record.get('icao')}  "
+          f"type:{record.get('message_type')}  "
+          f"lat:{record.get('latitude')}  "
+          f"lon:{record.get('longitude')}")
 
 
 def _snr(index, magnitude):
-    """Same formula as SNR_Calculation() in this file."""
+    """SNR calculation (same formula as original SignalVisualizer)."""
     sig   = magnitude[index: index + 224]
     noise = magnitude[max(0, index - 225): max(0, index - 1)]
     if len(sig) < 10 or len(noise) < 10:
         return None
-    sp = (sum(sig)   ** 2) / len(sig)
+    sp  = (sum(sig)   ** 2) / len(sig)
     np_ = (sum(noise) ** 2) / len(noise)
     if np_ <= 0:
         return None
     return round(10 * math.log10(sp / np_), 2)
+
+# # ── helper: write one JSON file per detected frame ─────────────────────────
+# def export_message(shift_index, bin_str, magnitude,   # ← NEW FUNCTION
+#                    capture_file, start_byte,
+#                    c1_ratio=None, c3_power_ratio=None, c4_null_count=None):
+#     """
+#     Called once per detected frame immediately after bit-slicing.
+#     Decodes the 112-bit binary string, builds a record, and writes it to
+#     output/<shift_index>.json so that adsb_to_firebase.py picks it up
+#     in real time via file-system watching.
+#     """
+#     record = {
+#         "shift_index":    shift_index,
+#         "captured_at":    datetime.datetime.utcnow().isoformat() + "Z",
+#         "capture_file":   capture_file,
+#         "slice_start_byte": start_byte,
+#         "sample_rate_msps": 2,
+#         "final_decision": True,
+#         "c1_ratio":       round(c1_ratio, 3)       if c1_ratio       is not None else None,
+#         "c2_match":       True,
+#         "c3_power_ratio": round(c3_power_ratio, 4) if c3_power_ratio is not None else None,
+#         "c4_null_count":  int(c4_null_count)        if c4_null_count  is not None else None,
+#         "snr_db":         _snr(shift_index, magnitude),
+#         "registration": None,
+#         "manufacturername": None,
+#         "model": None,
+#         "serialnumber": None,
+#         "linenumber": None,
+#         "operator": None,
+#         "operatorcallsign": None,
+#         "operatoricao": None,
+#         "owner": None,
+#         "built": None,
+#         "status": None,
+#         "registered": None,
+#         "typecode_db": None,
+#         "hex_message":    None,
+#         "crc_valid":      False,
+#         "icao":           None,
+#         "typecode":       None,
+#         "df":             None,
+#         "message_type":   "UNKNOWN",
+#         "altitude_ft":    None,
+#         "altitude_m":     None,
+#         "latitude":       None,
+#         "longitude":      None,
+#         "raw_cpr_lat":    None,
+#         "raw_cpr_lon":    None,
+#         "cpr_format":     None,
+#         "callsign":       None,
+#         "groundspeed_kt":    None,
+#         "groundspeed_kmh":   None,
+#         "track_angle_deg":   None,
+#         "airspeed_kt":       None,
+#         "airspeed_kmh":      None,
+#         "heading_deg":       None,
+#         "vertical_rate_fpm": None,
+#         "vertical_rate_ms":  None,
+#         "vertical_status":   None,
+#     }
+
+#     try:
+#         hex_msg  = bin2hex(bin_str)
+#         decoded  = pms.decode(hex_msg)
+#         is_valid = decoded.get("crc_valid", False)
+#         tc       = decoded.get("typecode")
+
+#         record["hex_message"] = hex_msg
+#         record["crc_valid"]   = bool(is_valid)
+#         record["icao"]        = decoded.get("icao")
+#         record["typecode"]    = tc
+#         record["df"]          = decoded.get("df")
+
+#         if is_valid and tc is not None:
+
+#             if 1 <= tc <= 4:
+#                 record["message_type"] = "IDENTIFICATION"
+#                 record["callsign"]     = decoded.get("callsign")
+
+#             elif 5 <= tc <= 8:
+#                 record["message_type"] = "SURFACE_POSITION"
+#                 gs = decoded.get("groundspeed")
+#                 if gs is not None:
+#                     record["groundspeed_kt"]  = round(gs, 2)
+#                     record["groundspeed_kmh"] = round(gs * 1.852, 2)
+#                 lat = decoded.get("latitude")
+#                 lon = decoded.get("longitude")
+#                 if lat is not None:
+#                     record["latitude"]  = lat
+#                     record["longitude"] = lon
+#                 else:
+#                     if len(bin_str) >= 88:
+#                         record["raw_cpr_lat"] = int(bin_str[54:71], 2)
+#                         record["raw_cpr_lon"] = int(bin_str[71:88], 2)
+#                 cpr = decoded.get("cpr_format")
+#                 if cpr is None and len(bin_str) >= 54:
+#                     cpr = int(bin_str[53])
+#                 record["cpr_format"] = "Odd" if cpr == 1 else "Even"
+
+#             elif 9 <= tc <= 18:
+#                 record["message_type"] = "AIRBORNE_POSITION"
+#                 alt_ft = decoded.get("altitude")
+#                 if alt_ft is not None:
+#                     record["altitude_ft"] = alt_ft
+#                     record["altitude_m"]  = round(alt_ft * 0.3048, 1)
+#                 lat = decoded.get("latitude")
+#                 lon = decoded.get("longitude")
+#                 if lat is not None:
+#                     record["latitude"]  = lat
+#                     record["longitude"] = lon
+#                 else:
+#                     if len(bin_str) >= 88:
+#                         record["raw_cpr_lat"] = int(bin_str[54:71], 2)
+#                         record["raw_cpr_lon"] = int(bin_str[71:88], 2)
+#                 cpr = decoded.get("cpr_format")
+#                 if cpr is None and len(bin_str) >= 54:
+#                     cpr = int(bin_str[53])
+#                 record["cpr_format"] = "Odd" if cpr == 1 else "Even"
+
+#             elif tc == 19:
+#                 record["message_type"] = "AIRBORNE_VELOCITY"
+#                 gs = decoded.get("groundspeed")
+#                 if gs is not None:
+#                     record["groundspeed_kt"]  = round(gs, 2)
+#                     record["groundspeed_kmh"] = round(gs * 1.852, 2)
+#                     record["track_angle_deg"] = decoded.get("track")
+#                 airspeed = decoded.get("airspeed")
+#                 if airspeed is not None:
+#                     record["airspeed_kt"]  = round(airspeed, 2)
+#                     record["airspeed_kmh"] = round(airspeed * 1.852, 2)
+#                     record["heading_deg"]  = decoded.get("heading")
+#                 vrate = decoded.get("vertical_rate")
+#                 if vrate is not None:
+#                     record["vertical_rate_fpm"] = vrate
+#                     record["vertical_rate_ms"]  = round((vrate * 0.3048) / 60, 2)
+#                     record["vertical_status"]   = "Climbing" if vrate > 0 else "Descending"
+
+#             elif tc == 31:
+#                 record["message_type"] = "OPERATIONAL_STATUS"
+#                 record["callsign"]     = str(decoded.get("capability", "N/A"))
+
+#             else:
+#                 record["message_type"] = f"RESERVED_TC{tc}"
+
+#         else:
+#             record["message_type"] = "INVALID_CRC" if not is_valid else "UNKNOWN_TC"
+
+#             # ==========================================================
+#         # AIRCRAFT DATABASE LOOKUP
+#         # ==========================================================
+
+#         icao_hex = record["icao"]
+
+#         if icao_hex:
+#             try:
+#                 label, aircraft_info = lookup(icao_hex)
+
+#                 if aircraft_info:
+
+#                     record["registration"]     = aircraft_info.get("registration")
+#                     record["manufacturername"] = aircraft_info.get("manufacturername")
+#                     record["model"]            = aircraft_info.get("model")
+#                     record["serialnumber"]     = aircraft_info.get("serialnumber")
+#                     record["linenumber"]       = aircraft_info.get("linenumber")
+#                     record["operator"]         = aircraft_info.get("operator")
+#                     record["operatorcallsign"] = aircraft_info.get("operatorcallsign")
+#                     record["operatoricao"]     = aircraft_info.get("operatoricao")
+#                     record["owner"]            = aircraft_info.get("owner")
+#                     record["built"]            = aircraft_info.get("built")
+#                     record["status"]           = aircraft_info.get("status")
+#                     record["registered"]       = aircraft_info.get("registered")
+#                     record["typecode_db"]      = aircraft_info.get("typecode")
+
+#                     print(f"[DB] {icao_hex} → {label}")
+
+#                 else:
+#                     print(f"[DB] No aircraft match for ICAO {icao_hex}")
+
+#             except Exception as e:
+#                 print(f"[DB] Lookup error: {e}")        
+
+#     except Exception as e:
+#         record["message_type"] = f"DECODE_ERROR: {e}"
+
+#     # ── write atomically so the watcher never reads a half-written file ──
+#     out_path = os.path.join(OUTPUT_DIR, f"{shift_index}.json")
+#     tmp_path = out_path + ".tmp"
+#     with open(tmp_path, "w") as f:
+#         json.dump(record, f, indent=2)
+#     os.replace(tmp_path, out_path)          # atomic on Linux & Windows
+#     print(f"  [export] → {out_path}  ICAO:{record['icao']}  type:{record['message_type']}")
+
+
+# def _snr(index, magnitude):
+#     """Same formula as SNR_Calculation() in this file."""
+#     sig   = magnitude[index: index + 224]
+#     noise = magnitude[max(0, index - 225): max(0, index - 1)]
+#     if len(sig) < 10 or len(noise) < 10:
+#         return None
+#     sp = (sum(sig)   ** 2) / len(sig)
+#     np_ = (sum(noise) ** 2) / len(noise)
+#     if np_ <= 0:
+#         return None
+#     return round(10 * math.log10(sp / np_), 2)
 
 
 # ──────────────────────────────────────────────────────────────────────────
