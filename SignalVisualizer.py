@@ -17,12 +17,20 @@ import os
 # ── Global results store (written live to disk on every confirmed detection) ──
 RESULTS_FILE = "output/results.json"
 os.makedirs("output", exist_ok=True)
-
+"""
 if os.path.exists(RESULTS_FILE):
     with open(RESULTS_FILE, "r") as _f:
         all_results = json.load(_f)
-else:
-    all_results = {
+    # Ensure any legacy or manually edited results file still has required keys
+    all_results.setdefault("capture_file", "")
+    all_results.setdefault("sample_rate_msps", 2)
+    all_results.setdefault("detections", [])
+    all_results.setdefault("total_c1", 0)
+    all_results.setdefault("total_c2", 0)
+    all_results.setdefault("total_c3", 0)
+    all_results.setdefault("total_final", 0)
+else:"""
+all_results = {
         "capture_file": "",
         "sample_rate_msps": 2,
         "detections": [],
@@ -51,6 +59,124 @@ def Bit_Slicer(message, Msg_length=224):
                 decoded[:] = "Rejected"
                 break
         message[key] = "".join(map(str, decoded))
+def DecoderAdsb(binmsg,global_byte,c1_ratio,c3_ratio,c4_count):
+               
+
+
+    try :
+        bin_str = str(binmsg)
+        hex_msg = pms.util.bin2hex(bin_str)
+        
+        # Use pyModeS high-level decode
+        decoded = pms.decode(hex_msg)
+        
+        is_valid = decoded.get("crc_valid", False)
+        tc = decoded.get("typecode")
+        icao = decoded.get("icao")
+        
+        # Initialize the output dictionary with all potential fields set to None
+        output = {
+            "hex_msg": hex_msg,
+            "crc_valid": is_valid,
+            "icao": icao,
+            "typecode": tc,
+            "message_category": None,
+            "global_byte" : global_byte,
+            "c1_ratio": c1_ratio,
+            "c3_ratio": c3_ratio,
+            "c4_count": c4_count,
+            "callsign": None,
+            "groundspeed_kts": None,
+            "groundspeed_kmh": None,
+            "airspeed_kts": None,
+            "airspeed_kmh": None,
+            "track_angle": None,
+            "heading": None,
+            "vertical_rate_fpm": None,
+            "vertical_rate_ms": None,
+            "vertical_status": None,
+            "altitude_ft": None,
+            "latitude": None,
+            "longitude": None,
+            "raw_cpr_lat": None,
+            "raw_cpr_lon": None,
+            "capability": None,
+            "error": None
+        }
+
+        # Check for message validity before proceeding
+        if not is_valid or tc is None:
+            output["error"] = "Invalid CRC or Unknown Typecode"
+            return output
+
+        # [1-4] IDENTIFICATION
+        if 1 <= tc <= 4:
+            output["message_category"] = "IDENTIFICATION"
+            output["callsign"] = decoded.get("callsign")
+
+        # [5-8] SURFACE POSITION
+        elif 5 <= tc <= 8:
+            output["message_category"] = "SURFACE POSITION"
+            gs = decoded.get('groundspeed')
+            if gs is not None:
+                output["groundspeed_kts"] = gs
+                output["groundspeed_kmh"] = round(gs * 1.852, 2)
+            
+            lat = decoded.get('latitude')
+            lon = decoded.get('longitude')
+            if lat is not None and lon is not None:
+                output["latitude"] = lat
+                output["longitude"] = lon
+            elif len(bin_str) >= 88:
+                output["raw_cpr_lat"] = int(bin_str[54:71], 2)
+                output["raw_cpr_lon"] = int(bin_str[71:88], 2)
+
+        # [9-18] AIRBORNE POSITION
+        elif 9 <= tc <= 18:
+            output["message_category"] = "AIRBORNE POSITION"
+            output["altitude_ft"] = decoded.get('altitude')  # Fixed the syntax from your original snippet
+            
+            lat = decoded.get('latitude')
+            lon = decoded.get('longitude')
+            if lat is not None and lon is not None:
+                output["latitude"] = lat
+                output["longitude"] = lon
+            elif len(bin_str) >= 88:
+                output["raw_cpr_lat"] = int(bin_str[54:71], 2)
+                output["raw_cpr_lon"] = int(bin_str[71:88], 2)
+
+        # [19] AIRBORNE VELOCITY
+        elif tc == 19:
+            output["message_category"] = "AIRBORNE VELOCITY"
+            
+            gs = decoded.get('groundspeed')
+            if gs is not None:
+                output["groundspeed_kts"] = gs
+                output["groundspeed_kmh"] = round(gs * 1.852, 2)
+                output["track_angle"] = decoded.get('track')
+                
+            airspeed = decoded.get('airspeed')
+            if airspeed is not None:
+                output["airspeed_kts"] = airspeed
+                output["airspeed_kmh"] = round(airspeed * 1.852, 2)
+                output["heading"] = decoded.get('heading')
+                
+            vrate_fpm = decoded.get('vertical_rate')
+            if vrate_fpm is not None:
+                output["vertical_rate_fpm"] = vrate_fpm
+                output["vertical_rate_ms"] = round((vrate_fpm * 0.3048) / 60, 2)
+                output["vertical_status"] = "Climbing" if vrate_fpm > 0 else "Descending"
+
+        # [31] OPERATIONAL STATUS
+        elif tc == 31:
+            output["message_category"] = "OPERATIONAL STATUS"
+            output["capability"] = decoded.get("capability")
+        #print(output)
+        return output
+
+    except Exception as e:
+        # Returns the error safely inside the dict rather than crashing the script
+        return {"error": str(e)}
 
 # ── SNR calculation (unchanged from your original) ───────────────────────────
 def SNR_Calculation(index, signal):
@@ -62,34 +188,88 @@ def SNR_Calculation(index, signal):
         return 0.0
     return round(10 * math.log10(x / w), 2)
 
-# ── Write one confirmed detection to JSON immediately ─────────────────────────
-def save_detection(local_idx, global_byte, c1_ratio, c3_ratio,
-                   c4_count, signal):
+def save_detection(local_idx, global_byte, c1_ratio, c3_ratio, c4_count, signal):
+    # Assuming SNR_Calculation is defined elsewhere in your script
     snr = SNR_Calculation(local_idx, signal)
 
+    
+    start = local_idx + 16
+    end = start + 224
+    if end > len(signal):
+        return None
+
+    msg_samples = signal[start:end]
+    bits = []
+    for k in range(0, 224, 2):
+        if msg_samples[k] >= msg_samples[k + 1]:
+            bits.append('1')
+        else:
+            bits.append('0')
+
+    bin_strr = "".join(bits)
+       # Call the decoding function to print message details
+    # Execute the decode attempt
+    detection = DecoderAdsb(bin_strr,global_byte,c1_ratio,c3_ratio,c4_count)
+
+    # Set up default empty values in case decoding failed
+    """msg_data = {
+        "hex_msg": None, "offset": None, "icao": None, "typecode": None, 
+        "crc_valid": False, "callsign": None, "altitude": None, 
+        "latitude": None, "longitude": None, "speed": None, 
+        "heading": None, "vertical_rate": None
+    }
+    
+    # If successful, overwrite the defaults with actual data
+    if msg_data is not None:
+        msg_data.update(best_candidate)
+    
+    # Build the final detection dictionary mapped cleanly
     detection = {
         "global_byte_offset": global_byte,
+        "message_offset":     msg_data["offset"],
         "c1_ratio":           round(c1_ratio, 3),
         "c2_match":           True,
         "c3_power_ratio":     round(c3_ratio, 3),
         "c4_null_count":      c4_count,
         "snr_db":             snr,
-        "final_decision":     True
+        "final_decision":     True,
+        "hex_message":        msg_data["hex"],
+        "icao":               msg_data["icao"],
+        "typecode":           msg_data["typecode"],
+        "crc_valid":          msg_data["crc_valid"],
+        "callsign":           msg_data["callsign"],
+        "altitude":           msg_data["altitude"],
+        "latitude":           msg_data["latitude"],
+        "longitude":          msg_data["longitude"],
+        "groundspeed":        msg_data["speed"],       # Maps your groundspeed field to the extracted speed
+        "track":              msg_data["heading"],     # Maps your track field to the extracted heading
+        "vertical_rate":      msg_data["vertical_rate"]
     }
-
+    """
+    print(detection)
     all_results["detections"].append(detection)
     all_results["total_final"] += 1
-
+   # Save the updated results to the JSON file
     with open(RESULTS_FILE, "w") as _f:
         json.dump(all_results, _f, indent=2)
 
+    # Safely extract values from the 'detection' dict we just built
+    """icao = detection["icao"] if detection["icao"] is not None else "N/A"
+    tc = detection["typecode"] if detection["typecode"] is not None else "N/A"
+    hex_msg_str = detection["hex_message"] if detection["hex_message"] is not None else "N/A"
+    crc_status = "✓ VALID" if detection["crc_valid"] else "✗ FAIL"
+    """
+    # Print the formatted output
     print(f"\n✓  PREAMBLE CONFIRMED"
           f"  global_byte={global_byte:,}"
           f"  SNR={snr:.1f} dB"
           f"  C1={c1_ratio:.1f}"
           f"  C3={c3_ratio:.2f}"
-          f"  C4_nulls={c4_count}")
-
+          f"  C4_nulls={c4_count}"
+          f"  HEX={detection["hex_msg"]}"
+          f"  ICAO={detection["icao"]}"
+          f"  TC={detection["typecode"]}"
+          f"  CRC={detection["crc_valid"]}")
 # ── Process one chunk: run all 4 criteria, write JSON on each confirmation ───
 def process_chunk(signal, byte_offset, overlap_len,
                   total_c1, total_c2, total_c3, total_c4):
@@ -147,8 +327,9 @@ def process_chunk(signal, byte_offset, overlap_len,
                 ExceedThreshold[maximum] = Static_Ratio
 
     total_c1 += len(ExceedThreshold)
+
     #print(f"  C1: {len(ExceedThreshold)} candidates at indices "
-    #      f"{list(ExceedThreshold.keys())}")
+     #     f"{list(ExceedThreshold.keys())}")
 
     # ── CRITERIA 2 / 3 / 4: tested immediately for each C1 candidate ─────────
     ref = "110010001"     # deterministic symbol pattern for DF=17
@@ -230,20 +411,31 @@ def process_chunk(signal, byte_offset, overlap_len,
         save_detection(local_idx, global_byte,
                        c1_ratio, c3_ratio, empty_count, signal)
 
-    return total_c1, total_c2, total_c3, total_c4
+    return total_c1, total_c2, total_c3, total_c4, list(ExceedThreshold.keys())
 
 
 #main 
 condition = True
 while condition:
-    BinaryFile = "C:/Users/ucef-/Desktop/Captures/ForRtl/output_8bit.bin"
-    file_size  = os.path.getsize(BinaryFile)
     print("=====================>>>>>>>><<<<<<<==================")
-    print(f"\nWelcome to ADS-B Visualizer >>> your file is of size {file_size}")
+    
     print("=====================>>>>>>>><<<<<<<==================")
     print("\nWelcome to ADS-B Visualizer >>>")
     print("\nPress 0 to exit")
+    File = (input("\nTo Convert File Select 1, to read from file select 2 : "))
 
+    if File =="1":
+        Filename =  input("\n Filename: ")
+        Filename = "C:/Users/ucef-/Desktop/Captures/"+Filename
+        data = np.fromfile(Filename, dtype=np.int16);
+        (((data.astype(np.float32) + 32768) / 256)).astype(np.uint8).tofile('C:/Users/ucef-/Desktop/Captures/ForRtl/output_8bit.bin')
+        BinaryFile = "C:/Users/ucef-/Desktop/Captures/ForRtl/output_8bit.bin"
+    elif File =="2" :
+
+        BinaryFile = "C:/Users/ucef-/Desktop/raw_iq_signalsflights5.bin"
+    
+    file_size  = os.path.getsize(BinaryFile)
+    print(f"\n>>> your file is of size {file_size} number of IQ Samples is : {file_size//2} <<<")
     NSamples   = int(input("Enter the number of samples in plot (20, 100, 2000): ")) * 2
     timeOfPlot = (NSamples / 2) * 0.5
     SliceN     = input(
@@ -251,7 +443,10 @@ while condition:
         f"integer of the {timeOfPlot} micro sec: "
     )
 
-    if int(SliceN) == 0:
+    # Only exit the main loop when the user explicitly requests it by
+    # entering '0' at the top menu. The previous condition always
+    # evaluated to True for non-zero numeric inputs, causing an early exit.
+    if File == "0":
         break
 
     # scaler for plot x-axis ticks (unchanged)
@@ -269,8 +464,12 @@ while condition:
     all_results["capture_file"] = BinaryFile
 
     print(f"\nFile: {BinaryFile}  ({file_size/1e6:.1f} MB)")
-
-    CHUNK_SAMPLES = 100_000     # 100k IQ pairs = 200k bytes per chunk
+    if NSamples//50_000 ==0:
+        
+        CHUNK_SAMPLES = NSamples//2 
+    else :
+        CHUNK_SAMPLES = 100_000
+             # 100k IQ pairs = 200k bytes per chunk
     OVERLAP       = 256         # samples carried over to next chunk
     DC_Shift      = 0.7
 
@@ -278,14 +477,24 @@ while condition:
     byte_offset = 0             # current file position in bytes
     total_c1 = total_c2 = total_c3 = total_c4 = 0
 
-    # ── Store ONE chunk for the visualiser (the slice the user asked for) ──
+    # ── Calculate byte position for the desired slice ──
+    # NSamples is already multiplied by 2 from user input
+    # Each sample is 1 byte (I or Q), so NSamples bytes per sample pair
     vis_start_byte = NSamples * (int(SliceN) - 1)
+    vis_end_byte = NSamples * (int(SliceN) )
+    print(f"\nVisualization start byte: {vis_start_byte} and end byte {vis_start_byte}")  # position in BYTES
     vis_Magnitude  = []
     vis_CorrelationValues = None
 
     with open(BinaryFile, "rb") as f:
+        # ── SEEK to the beginning of the desired visualization slice ──
+        f.seek(vis_start_byte)
+        byte_offset = vis_start_byte
 
-        while byte_offset < file_size:
+        # ── Read only the slice requested by the user, plus overlap if needed ──
+        read_limit = vis_start_byte + NSamples
+        
+        while byte_offset < read_limit and byte_offset < file_size:
 
             raw = f.read(CHUNK_SAMPLES * 2)     # read 200k bytes
             if not raw:
@@ -293,25 +502,32 @@ while condition:
 
             # ── Convert bytes → magnitude (same formula as your original) ──
             chunk_mag = []
+            I_val = []
+            Q_val = []  
             for i in range(0, len(raw) - 1, 2):
-                I_val = raw[i]     - 127.5
-                Q_val = raw[i + 1] - 127.5
-                chunk_mag.append(math.sqrt(I_val * I_val + Q_val * Q_val) - DC_Shift)
+                I_val.append(raw[i]     - 127.5)
+                Q_val.append(raw[i + 1] - 127.5)
+            """print(I_val)"""
+            #I_val -= np.mean(I_val)
+            #Q_val -= np.mean(Q_val)
+            """print(I_val)"""
+            for j in range(len(list(I_val))):
+                chunk_mag.append(math.sqrt(I_val[j] * I_val[j] + Q_val[j] * Q_val[j]) - DC_Shift)
 
             # ── Prepend overlap from previous chunk ──
             signal = buffer + chunk_mag
 
             # ── Capture the slice the user wants for the visualiser ──
-            if vis_start_byte >= byte_offset and \
-               vis_start_byte < byte_offset + len(raw):
-                local_start = (vis_start_byte - byte_offset) // 2
-                vis_Magnitude = signal[local_start: local_start + NSamples // 2]
+            # Now that we've seeked to vis_start_byte, the first chunk we read IS the start
+            if len(vis_Magnitude) == 0 and byte_offset == vis_start_byte:
+                # First chunk after seeking: extract the visualization
+                vis_Magnitude = signal[0: NSamples // 2]
                 vis_CorrelationValues = np.correlate(
                     vis_Magnitude, preamble, mode="valid"
                 )
-
+            
             # ── Run the 4-criterion detector on this chunk ──
-            total_c1, total_c2, total_c3, total_c4 = process_chunk(
+            total_c1, total_c2, total_c3, total_c4,ExceedThreshold = process_chunk(
                 signal, byte_offset, len(buffer),
                 total_c1, total_c2, total_c3, total_c4
             )
@@ -320,18 +536,22 @@ while condition:
             all_results["total_c1"] = total_c1
             all_results["total_c2"] = total_c2
             all_results["total_c3"] = total_c3
-            all_results["total_final"] = total_c4
+            all_results["total_c4"] = total_c4
 
             # ── Carry overlap to next chunk ──
-            buffer      = chunk_mag[-OVERLAP:]
+            if CHUNK_SAMPLES ==100_000 :
+                buffer      = chunk_mag[-OVERLAP:]
+                
             byte_offset += len(raw)
-
             print(f"  Progress: {byte_offset/1e6:.1f} MB / "
-                  f"{file_size/1e6:.0f} MB   "
-                  f"confirmed={total_c4}", end="\r")
-
-    print(f"\n\nDone. C1={total_c1}  C2={total_c2}  "
-          f"C3={total_c3}  Final={total_c4}")
+                  f"{NSamples/1e6:.0f} MB   "
+                  f"confirmed={total_c4}    "
+                   
+                  , end="\r")
+    print (byte_offset)
+    print(f"\n\nDone. C1={total_c1} ,   C2={total_c2}  "
+          f"C3={total_c3}  C4={total_c4}")
+    print(f"\nExceedthreshold_C1 = {ExceedThreshold}")
     print(f"Results saved to {RESULTS_FILE}")
 
     # ── Use vis_Magnitude for the visualiser below (same as your original) ──
@@ -341,96 +561,63 @@ while condition:
     limit = len(Magnitude) - 17
     start_byte = vis_start_byte
 
-    # ════════════════════════════════════════════════════════════════════════
-    # EVERYTHING BELOW THIS LINE IS YOUR ORIGINAL VISUALISER CODE UNCHANGED
-    # ════════════════════════════════════════════════════════════════════════
-
-    def Decoding(binmsg):
-        for key, value in binmsg.items():
-            print(f"\n{'='*50}")
-            print(f"REPORT FOR INDEX: {key}")
-            try:
-                bin_str = str(value)
-                hex_msg = pms.util.bin2hex(bin_str)
-                decoded = pms.decode(hex_msg)
-                is_valid = decoded.get("crc_valid", False)
-                tc   = decoded.get("typecode")
-                icao = decoded.get("icao")
-                print(f"Hex Message:  {hex_msg}")
-                print(f"CRC Result:   {'Valid' if is_valid else 'Corrupted'}")
-                print(f"ICAO Address: {icao}")
-                print(f"Typecode:     {tc}")
-                print(f"{'-'*50}")
-                if not is_valid or tc is None:
-                    print("Skipping detailed parse (Invalid CRC or Unknown Typecode).")
-                    continue
-                if 1 <= tc <= 4:
-                    print(f"[IDENTIFICATION]")
-                    print(f"Callsign: {decoded.get('callsign', 'N/A')}")
-                elif 5 <= tc <= 8:
-                    print(f"[SURFACE POSITION]")
-                    gs = decoded.get('groundspeed')
-                    if gs is not None:
-                        print(f"Ground Speed: {gs} knots ({round(gs*1.852,2)} km/h)")
-                    lat = decoded.get('latitude')
-                    lon = decoded.get('longitude')
-                    if lat is not None and lon is not None:
-                        print(f"Latitude:  {lat}")
-                        print(f"Longitude: {lon}")
-                    else:
-                        if len(bin_str) >= 88:
-                            print(f"Raw CPR Lat: {int(bin_str[54:71],2)}")
-                            print(f"Raw CPR Lon: {int(bin_str[71:88],2)}")
-                elif 9 <= tc <= 18:
-                    print(f"[AIRBORNE POSITION]")
-                    print(f"Altitude: {decoded.get('altitude','N/A')} ft")
-                    lat = decoded.get('latitude')
-                    lon = decoded.get('longitude')
-                    if lat is not None and lon is not None:
-                        print(f"Latitude:  {lat}")
-                        print(f"Longitude: {lon}")
-                    else:
-                        if len(bin_str) >= 88:
-                            print(f"Raw CPR Lat: {int(bin_str[54:71],2)}")
-                            print(f"Raw CPR Lon: {int(bin_str[71:88],2)}")
-                elif tc == 19:
-                    print(f"[AIRBORNE VELOCITY]")
-                    gs = decoded.get('groundspeed')
-                    if gs is not None:
-                        print(f"Ground Speed: {gs} knots ({round(gs*1.852,2)} km/h)")
-                        print(f"Track Angle:  {decoded.get('track')}°")
-                    airspeed = decoded.get('airspeed')
-                    if airspeed is not None:
-                        print(f"Air Speed: {airspeed} knots ({round(airspeed*1.852,2)} km/h)")
-                        print(f"Heading:   {decoded.get('heading')}°")
-                    vrate_fpm = decoded.get('vertical_rate')
-                    if vrate_fpm is not None:
-                        vrate_ms = round((vrate_fpm * 0.3048) / 60, 2)
-                        status = "Climbing" if vrate_fpm > 0 else "Descending"
-                        print(f"Vertical Rate: {vrate_fpm} fpm ({status}) → {abs(vrate_ms)} m/s")
-                elif tc == 31:
-                    print(f"[OPERATIONAL STATUS]")
-                    print(f"Capability: {decoded.get('capability','N/A')}")
-            except Exception as e:
-                print(f"Error at index {key}: {e}")
-
+    
     # Build msg from confirmed detections for decoding
     msg = {}
     for det in all_results["detections"]:
-        # re-map global byte back to vis_Magnitude local index for display
-        g_byte = det["global_byte_offset"]
-        local  = (g_byte - vis_start_byte) // 2
-        if 0 <= local < len(Magnitude) - 240:
-            msg[local] = Magnitude[local + 16: local + 240]
+        if det.get("hex_message"):
+            idx = len(msg)
+            msg[idx] = {
+                "hex": det["hex_message"],
+                "icao": det.get("icao"),
+                "typecode": det.get("typecode"),
+                "crc_valid": det.get("crc_valid"),
+                "snr": det.get("snr_db"),
+                "message_offset": det.get("message_offset"),
+                "callsign": det.get("callsign"),
+                "altitude": det.get("altitude"),
+                "latitude": det.get("latitude"),
+                "longitude": det.get("longitude"),
+                "groundspeed": det.get("groundspeed"),
+                "track": det.get("track"),
+                "vertical_rate": det.get("vertical_rate"),
+                "cpr_even_odd": det.get("cpr_even_odd")
+            }
 
-    try:
-        Bit_Slicer(msg)
-    except Exception:
-        print("\nCould not slice message bits — increase samples")
-    print(msg)
-    Decoding(msg)
+    # Display the already-decoded messages
+    if msg:
+        print("\n" + "="*70)
+        print("DECODED MESSAGES FROM DETECTIONS:")
+        print("="*70)
+        for idx, msg_data in msg.items():
+            print(f"\n[Message {idx}]")
+            print(f"  HEX:            {msg_data['hex']}")
+            print(f"  ICAO:           {msg_data['icao']}")
+            print(f"  TC:             {msg_data['typecode']}")
+            print(f"  CRC:            {'✓ VALID' if msg_data['crc_valid'] else '✗ FAILED'}")
+            print(f"  SNR:            {msg_data['snr']} dB")
+            if msg_data.get('message_offset') is not None:
+                print(f"  Message offset: {msg_data['message_offset']} samples after preamble start")
+            if msg_data.get('callsign'):
+                print(f"  Callsign:       {msg_data['callsign']}")
+            if msg_data.get('altitude') is not None:
+                print(f"  Altitude:       {msg_data['altitude']}")
+            if msg_data.get('groundspeed') is not None:
+                print(f"  Ground Speed:   {msg_data['groundspeed']} knots")
+            if msg_data.get('track') is not None:
+                print(f"  Track:          {msg_data['track']}°")
+            if msg_data.get('vertical_rate') is not None:
+                print(f"  Vertical Rate:  {msg_data['vertical_rate']}")
+            if msg_data.get('cpr_even_odd') is not None:
+                print(f"  CPR parity:     {msg_data['cpr_even_odd']}")
+            if msg_data.get('latitude') is not None and msg_data.get('longitude') is not None:
+                print(f"  Latitude:       {msg_data['latitude']}")
+                print(f"  Longitude:      {msg_data['longitude']}")
+    else:
+        print("\nNo decoded messages available.")
     limit = NSamples//2
-    if limit < 2000:
+    if limit < 2001:
+        print("hi")
         plt.style.use('_mpl-gallery')
         
         class SignalShifter:
@@ -470,9 +657,9 @@ while condition:
                     print("enter an integer")
 
 
-        Samples = int(NSamples/2)-1
+        Samples = int(NSamples/2)
         x = np.arange(0, int(Samples))
-        y = Magnitude
+        y = vis_Magnitude
 
         # the preamble pattern 
         xx = np.arange(0, 26)
@@ -482,7 +669,7 @@ while condition:
         Last_index = len(CorrelationValues)
         Corr_x = range(0,Last_index)
         
-        Corr_y = CorrelationValues
+        Corr_y = vis_CorrelationValues
 
         fig2 = plt.figure(figsize=(6,4))
         cx = fig2.add_axes([0.07, 0.1, 1, 1])
@@ -501,7 +688,7 @@ while condition:
 
         ax.set(xlim=(0, Samples), xticks= scaler*np.arange(1, Samples/scaler),
                ylim=(0, 12), yticks=np.arange(1, 12))
-
+        print("hola")
         #  Button
         # Pass the stem container (line) and base arrays into the class
         callback = SignalShifter(line, xx, yy)
