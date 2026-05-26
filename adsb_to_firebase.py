@@ -1,5 +1,3 @@
-
-
 # """
 # adsb_to_firebase.py
 # ────────────────────────────────────────────────────────────────────────────
@@ -170,7 +168,13 @@
 #             .document("latest")
 #             .collection("messages")
 #             .document(icao)
-#             .collection("types")
+#             .set(
+#                 {
+#                     "icao": icao,
+#                     "last_update": payload.get("last_update"),
+#                 },
+#                 merge=True,
+#             )
 #             .document(msg_type)
 #             .set(payload)
 #         )
@@ -366,14 +370,20 @@ _firestore_ready = False
 _firestore_db    = None
 
 
+SERVICE_ACCOUNT = "serviceAccountKey.json"
+
+
 def _init_firebase():
     global _firestore_ready, _firestore_db
+
     try:
         import firebase_admin
         from firebase_admin import credentials, firestore
     except ImportError:
         print("[!] firebase-admin not installed — run: pip install firebase-admin")
         return
+
+    SERVICE_ACCOUNT = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
 
     if not os.path.exists(SERVICE_ACCOUNT):
         print(f"[!] Missing {SERVICE_ACCOUNT} — Firestore disabled")
@@ -383,9 +393,11 @@ def _init_firebase():
         if not firebase_admin._apps:
             cred = credentials.Certificate(SERVICE_ACCOUNT)
             firebase_admin.initialize_app(cred)
-        _firestore_db    = firestore.client()
+
+        _firestore_db = firestore.client()
         _firestore_ready = True
         print("[✓] Firestore connected")
+
     except Exception as e:
         print(f"[!] Firebase init failed: {e}")
 
@@ -416,81 +428,93 @@ def _push_to_firestore(record: dict):
     Every field from the JSON is forwarded — including all new
     aircraft-database fields and the CPR-decoded position.
     """
-    icao     = record.get("icao") or "UNKNOWN"
+    icao = record.get("icao") or "UNKNOWN"
     msg_type = record.get("message_type", "UNKNOWN")
 
     payload = {
         # ── Signal metadata ───────────────────────────────────────────────
-        "shift_index":       record.get("shift_index"),
-        "captured_at":       record.get("captured_at"),
-        "snr_db":            record.get("snr_db"),
-        "crc_valid":         record.get("crc_valid", False),
-        "hex_message":       record.get("hex_message"),
-        "df":                record.get("df"),
-        "typecode":          record.get("typecode"),
-        "type":              msg_type,
-        "icao":              icao,
+        "shift_index": record.get("shift_index"),
+        "captured_at": record.get("captured_at"),
+        "snr_db": record.get("snr_db"),
+        "crc_valid": record.get("crc_valid", False),
+        "hex_message": record.get("hex_message"),
+        "df": record.get("df"),
+        "typecode": record.get("typecode"),
+        "type": msg_type,
+        "icao": icao,
 
         # ── Aircraft identity (from database) ─────────────────────────────
-        "registration":      record.get("registration"),
-        "manufacturericao":  record.get("manufacturericao"),
-        "manufacturername":  record.get("manufacturername"),
-        "model":             record.get("model"),
-        "typecode_db":       record.get("typecode_db"),
-        "serialnumber":      record.get("serialnumber"),
-        "linenumber":        record.get("linenumber"),
-        "icaoaircrafttype":  record.get("icaoaircrafttype"),
+        "registration": record.get("registration"),
+        "manufacturericao": record.get("manufacturericao"),
+        "manufacturername": record.get("manufacturername"),
+        "model": record.get("model"),
+        "typecode_db": record.get("typecode_db"),
+        "serialnumber": record.get("serialnumber"),
+        "linenumber": record.get("linenumber"),
+        "icaoaircrafttype": record.get("icaoaircrafttype"),
 
         # ── Operator / Owner ──────────────────────────────────────────────
-        "operator":          record.get("operator"),
-        "operatorcallsign":  record.get("operatorcallsign"),
-        "operatoricao":      record.get("operatoricao"),
-        "operatoriata":      record.get("operatoriata"),
-        "owner":             record.get("owner"),
+        "operator": record.get("operator"),
+        "operatorcallsign": record.get("operatorcallsign"),
+        "operatoricao": record.get("operatoricao"),
+        "operatoriata": record.get("operatoriata"),
+        "owner": record.get("owner"),
 
         # ── Registration history ──────────────────────────────────────────
-        "registered":        record.get("registered"),
-        "reguntil":          record.get("reguntil"),
-        "status":            record.get("status"),
-        "built":             record.get("built"),
-        "firstflightdate":   record.get("firstflightdate"),
+        "registered": record.get("registered"),
+        "reguntil": record.get("reguntil"),
+        "status": record.get("status"),
+        "built": record.get("built"),
+        "firstflightdate": record.get("firstflightdate"),
 
         # ── Technical specs ───────────────────────────────────────────────
         "seatconfiguration": record.get("seatconfiguration"),
-        "engines":           record.get("engines"),
-        "adsb_equipped":     record.get("adsb_equipped"),
-        "acars":             record.get("acars"),
+        "engines": record.get("engines"),
+        "adsb_equipped": record.get("adsb_equipped"),
+        "acars": record.get("acars"),
         "categoryDescription": record.get("categoryDescription"),
 
         # ── Decoded position (CPR-resolved — never raw CPR values) ────────
-        "latitude":          record.get("latitude"),
-        "longitude":         record.get("longitude"),
-        "altitude_ft":       record.get("altitude_ft"),
-        "altitude_m":        record.get("altitude_m"),
-        "position_source":   record.get("position_source"),
-        "cpr_format":        record.get("cpr_format"),
-        "cpr_even_hex":      record.get("cpr_even_hex"),
-        "cpr_odd_hex":       record.get("cpr_odd_hex"),
-        "cpr_gap_samples":   record.get("cpr_gap_samples"),
-        "cpr_gap_rf_s":      record.get("cpr_gap_rf_s"),
+        "latitude": record.get("latitude"),
+        "longitude": record.get("longitude"),
+        "altitude_ft": record.get("altitude_ft"),
+        "altitude_m": record.get("altitude_m"),
+        "position_source": record.get("position_source"),
+        "cpr_format": record.get("cpr_format"),
+        "cpr_even_hex": record.get("cpr_even_hex"),
+        "cpr_odd_hex": record.get("cpr_odd_hex"),
+        "cpr_gap_samples": record.get("cpr_gap_samples"),
+        "cpr_gap_rf_s": record.get("cpr_gap_rf_s"),
 
         # ── Velocity ─────────────────────────────────────────────────────
-        "callsign":          record.get("callsign"),
-        "groundspeed_kt":    record.get("groundspeed_kt"),
-        "groundspeed_kmh":   record.get("groundspeed_kmh"),
-        "track_angle_deg":   record.get("track_angle_deg"),
-        "airspeed_kt":       record.get("airspeed_kt"),
-        "airspeed_kmh":      record.get("airspeed_kmh"),
-        "heading_deg":       record.get("heading_deg"),
+        "callsign": record.get("callsign"),
+        "groundspeed_kt": record.get("groundspeed_kt"),
+        "groundspeed_kmh": record.get("groundspeed_kmh"),
+        "track_angle_deg": record.get("track_angle_deg"),
+        "airspeed_kt": record.get("airspeed_kt"),
+        "airspeed_kmh": record.get("airspeed_kmh"),
+        "heading_deg": record.get("heading_deg"),
         "vertical_rate_fpm": record.get("vertical_rate_fpm"),
-        "vertical_rate_ms":  record.get("vertical_rate_ms"),
-        "vertical_status":   record.get("vertical_status"),
-
+        "vertical_rate_ms": record.get("vertical_rate_ms"),
+        "vertical_status": record.get("vertical_status"),
         "last_update": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
     try:
         (
+            _firestore_db
+            .collection("adsb")
+            .document("latest")
+            .collection("messages")
+            .document(icao)
+            .set(
+                {
+                    "icao": icao,
+                    "last_update": payload.get("last_update"),
+                    "has_data": True,
+                },
+                merge=True,
+            ),
             _firestore_db
             .collection("adsb")
             .document("latest")

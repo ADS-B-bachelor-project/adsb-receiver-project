@@ -1180,7 +1180,7 @@ while condition:
     else:
         scaler = 100
         
-    BinaryFile = "captures/capture_Stah1090MHZ.bin"
+    BinaryFile = "captures/raw_iq_signalsflights5.bin"
 
     start_byte = 0
 
@@ -1514,7 +1514,7 @@ while condition:
         ax.set_ylabel("Magnitude ")
 
         ax.set(xlim=(0, Samples), xticks= scaler*np.arange(1, Samples/scaler),
-               ylim=(0, 12), yticks=np.arange(1, 12))
+               ylim=(0, 100), yticks=np.arange(1, 100, 10))
 
         callback = SignalShifter(line, xx, yy)
 
